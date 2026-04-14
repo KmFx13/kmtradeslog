@@ -8,7 +8,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, updateProfile, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
-  import { getFirestore, doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getFirestore, doc, getDoc, setDoc, updateDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyDKk0JNaGd3oUf7g4ZSQf0HJYDwgiooHTQ",
@@ -24,21 +24,48 @@
   const auth = getAuth(app);
   const db = getFirestore(app);
 
-  // Expose auth functions to global scope
+  // Expose auth + firestore functions to global scope
   window._fbAuth = auth;
   window._fbDb = db;
-  window._fbDoc = doc;
-  window._fbSetDoc = setDoc;
-  window._fbGetDoc = getDoc;
-  window._fbSignUp = (name, username, email, password) => {
-    return createUserWithEmailAndPassword(auth, email, password).then(cred => {
-      return updateProfile(cred.user, { displayName: name + '|' + username });
+
+  window._fbSignUp = async (name, username, email, password) => {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    await updateProfile(cred.user, { displayName: name + '|' + username });
+    // Create user document in Firestore (empty data for new user)
+    await setDoc(doc(db, 'users', cred.user.uid), {
+      displayName: name + '|' + username,
+      email: email,
+      profilePic: '',
+      trades: [],
+      reviews: [],
+      accounts: [],
+      activeAccountId: '',
+      createdAt: new Date().toISOString()
     });
+    return cred;
   };
+
   window._fbSignIn = (email, password) => signInWithEmailAndPassword(auth, email, password);
   window._fbSignOut = () => signOut(auth);
   window._fbResetPassword = (email) => sendPasswordResetEmail(auth, email);
   window._fbOnAuthStateChanged = (cb) => onAuthStateChanged(auth, cb);
+
+  // Save profile picture to Firestore (syncs across all devices)
+  window._fbSaveProfilePic = async (uid, dataUrl) => {
+    await updateDoc(doc(db, 'users', uid), { profilePic: dataUrl });
+  };
+
+  // Load user cloud data (profile pic, trades, accounts)
+  window._fbLoadUserData = async (uid) => {
+    const snap = await getDoc(doc(db, 'users', uid));
+    if (snap.exists()) return snap.data();
+    return null;
+  };
+
+  // Save all user data to Firestore
+  window._fbSaveUserData = async (uid, data) => {
+    await setDoc(doc(db, 'users', uid), data, { merge: true });
+  };
 </script>
 <style>
   :root {
@@ -1438,11 +1465,12 @@ function updateUserUI(user) {
   const parts = (user.displayName || '').split('|');
   const name = parts[0] || user.email.split('@')[0];
   const username = parts[1] || '';
-  const savedPic = localStorage.getItem('kmfx_profile_pic');
+  const uid = window._currentUid || user.uid || 'guest';
+  const savedPic = localStorage.getItem('kmfx_profile_pic_' + uid);
   // Topbar avatar
   const btn = document.getElementById('userAvatarBtn');
   if (btn) {
-    if (savedPic) { btn.innerHTML = `<img src="${savedPic}" alt="avatar">`; }
+    if (savedPic) { btn.innerHTML = `<img src="${savedPic}" alt="avatar" style="width:100%;height:100%;object-fit:cover;border-radius:50%;">`; }
     else { btn.textContent = name.charAt(0).toUpperCase(); }
   }
   // Sidebar
@@ -1467,14 +1495,23 @@ function handleProfilePicUpload(e) {
   const reader = new FileReader();
   reader.onload = ev => {
     const dataUrl = ev.target.result;
-    localStorage.setItem('kmfx_profile_pic', dataUrl);
+    const uid = window._currentUid || 'guest';
+    // Save per-user locally
+    localStorage.setItem('kmfx_profile_pic_' + uid, dataUrl);
+    // Save to Firestore so it syncs to ALL devices
+    if (uid !== 'guest' && window._fbSaveProfilePic) {
+      window._fbSaveProfilePic(uid, dataUrl)
+        .then(() => showToast('Profile picture synced to all devices! ✅'))
+        .catch(() => showToast('Profile picture saved locally ✅'));
+    } else {
+      showToast('Profile picture updated! ✅');
+    }
     // Update sidebar avatar
     const avatarEl = document.getElementById('sidebarAvatar');
     if (avatarEl) avatarEl.innerHTML = `<img src="${dataUrl}" alt="avatar">`;
     // Update topbar avatar
     const btn = document.getElementById('userAvatarBtn');
     if (btn) btn.innerHTML = `<img src="${dataUrl}" alt="avatar">`;
-    showToast('Profile picture updated! ✅');
   };
   reader.readAsDataURL(file);
   e.target.value = '';
@@ -1483,21 +1520,60 @@ function handleProfilePicUpload(e) {
 // Boot: wait for Firebase to be ready then listen
 function bootAuth() {
   if (window._fbOnAuthStateChanged) {
-    window._fbOnAuthStateChanged(user => {
+    window._fbOnAuthStateChanged(async user => {
       if (user) {
         document.getElementById('authOverlay').style.display = 'none';
-        updateUserUI(user);
+
         if (!window._appInited) {
           window._appInited = true;
+          const isNew = !!window._isNewSignUp;
+          window._isNewSignUp = false;
+
+          // Load cloud data for this user
+          try {
+            const cloudData = await window._fbLoadUserData(user.uid);
+            if (cloudData) {
+              // Restore trades, accounts, profile pic from Firestore
+              if (cloudData.trades && cloudData.trades.length) {
+                localStorage.setItem('kmfx_trades_' + user.uid, JSON.stringify(cloudData.trades));
+              }
+              if (cloudData.reviews && cloudData.reviews.length) {
+                localStorage.setItem('kmfx_reviews_' + user.uid, JSON.stringify(cloudData.reviews));
+              }
+              if (cloudData.accounts && cloudData.accounts.length) {
+                localStorage.setItem('kmfx_accounts_' + user.uid, JSON.stringify(cloudData.accounts));
+              }
+              if (cloudData.activeAccountId) {
+                localStorage.setItem('kmfx_activeAccount_' + user.uid, cloudData.activeAccountId);
+              }
+              if (cloudData.profilePic) {
+                localStorage.setItem('kmfx_profile_pic_' + user.uid, cloudData.profilePic);
+              }
+            }
+          } catch(e) { console.warn('Could not load cloud data:', e); }
+
+          // Store current user uid for scoped storage
+          window._currentUid = user.uid;
+
+          updateUserUI(user);
           init();
-          // New sign-ups go to Accounts page first; returning users go to Dashboard
-          if (window._isNewSignUp) {
-            window._isNewSignUp = false;
+
+          // New sign-ups → go to Accounts setup first
+          // Returning users → go to Dashboard
+          if (isNew) {
             navigate('accounts');
+            showToast('Welcome! Set up your first trading account below 👇');
+          } else {
+            navigate('dashboard');
           }
+        } else {
+          updateUserUI(user);
         }
       } else {
+        window._appInited = false;
+        window._currentUid = null;
         document.getElementById('authOverlay').style.display = 'flex';
+        switchAuthTab('login');
       }
     });
   } else {
@@ -1522,82 +1598,42 @@ let currentTags = [];
 let currentEmotion = '';
 let currentDirection = '';
 
-// ── Cloud save (Firestore) with localStorage fallback ──────────────────────
-function _currentUid() {
-  return window._fbAuth?.currentUser?.uid || null;
-}
+function saveData() {
+  const uid = window._currentUid || 'guest';
+  localStorage.setItem('kmfx_trades_' + uid, JSON.stringify(trades));
+  localStorage.setItem('kmfx_reviews_' + uid, JSON.stringify(reviews));
+  localStorage.setItem('kmfx_accounts_' + uid, JSON.stringify(accounts));
+  localStorage.setItem('kmfx_activeAccount_' + uid, activeAccountId || '');
 
-async function saveData() {
-  // Always keep localStorage in sync as a fast local cache
-  localStorage.setItem('kmfx_trades', JSON.stringify(trades));
-  localStorage.setItem('kmfx_reviews', JSON.stringify(reviews));
-  localStorage.setItem('kmfx_accounts', JSON.stringify(accounts));
-  localStorage.setItem('kmfx_activeAccount', activeAccountId || '');
-
-  // Also push to Firestore if user is logged in
-  const uid = _currentUid();
-  if (!uid || !window._fbDb) return;
-  try {
-    const ref = window._fbDoc(window._fbDb, 'users', uid);
-    await window._fbSetDoc(ref, {
+  // Sync to Firestore so data appears on all devices
+  if (uid !== 'guest' && window._fbSaveUserData) {
+    window._fbSaveUserData(uid, {
       trades,
       reviews,
       accounts,
-      activeAccountId: activeAccountId || '',
-      updatedAt: new Date().toISOString()
-    }, { merge: true });
-  } catch(e) {
-    console.warn('Firestore save failed, data kept locally:', e.message);
+      activeAccountId: activeAccountId || ''
+    }).catch(e => console.warn('Cloud sync failed:', e));
   }
 }
-
-async function loadData() {
-  const uid = _currentUid();
-
-  // Try Firestore first (cloud data wins)
-  if (uid && window._fbDb) {
-    try {
-      const ref = window._fbDoc(window._fbDb, 'users', uid);
-      const snap = await window._fbGetDoc(ref);
-      if (snap.exists()) {
-        const d = snap.data();
-        accounts = Array.isArray(d.accounts) ? d.accounts : [];
-        activeAccountId = d.activeAccountId || null;
-        trades = Array.isArray(d.trades) ? d.trades : [];
-        reviews = Array.isArray(d.reviews) ? d.reviews : [];
-        // Ensure default account exists
-        if (!accounts.length) {
-          const defAcct = { id: genId(), name: 'Main Live Account', type: 'live', broker: '', number: '', balance: 10000, currency: 'USD', maxDaily: 5, maxDD: 10, target: null, color: 'gold', notes: '', createdAt: new Date().toISOString() };
-          accounts.push(defAcct);
-          activeAccountId = defAcct.id;
-        }
-        if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) activeAccountId = accounts[0].id;
-        trades.forEach(t => { if (!t.accountId) t.accountId = accounts[0].id; });
-        // Mirror to localStorage cache
-        localStorage.setItem('kmfx_trades', JSON.stringify(trades));
-        localStorage.setItem('kmfx_reviews', JSON.stringify(reviews));
-        localStorage.setItem('kmfx_accounts', JSON.stringify(accounts));
-        localStorage.setItem('kmfx_activeAccount', activeAccountId || '');
-        return;
-      }
-    } catch(e) {
-      console.warn('Firestore load failed, falling back to localStorage:', e.message);
-    }
-  }
-
-  // Fallback: load from localStorage
+function loadData() {
+  const uid = window._currentUid || 'guest';
   try {
-    accounts = JSON.parse(localStorage.getItem('kmfx_accounts') || '[]');
-    activeAccountId = localStorage.getItem('kmfx_activeAccount') || null;
+    accounts = JSON.parse(localStorage.getItem('kmfx_accounts_' + uid) || '[]');
+    activeAccountId = localStorage.getItem('kmfx_activeAccount_' + uid) || null;
     if (!accounts.length) {
+      // Create default account
       const defAcct = { id: genId(), name: 'Main Live Account', type: 'live', broker: '', number: '', balance: 10000, currency: 'USD', maxDaily: 5, maxDD: 10, target: null, color: 'gold', notes: '', createdAt: new Date().toISOString() };
       accounts.push(defAcct);
       activeAccountId = defAcct.id;
     }
-    if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) activeAccountId = accounts[0].id;
-    const allTrades = JSON.parse(localStorage.getItem('kmfx_trades') || '[]');
+    if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) {
+      activeAccountId = accounts[0].id;
+    }
+    // Load trades for active account
+    const allTrades = JSON.parse(localStorage.getItem('kmfx_trades_' + uid) || '[]');
     trades = allTrades.filter ? allTrades : [];
-    reviews = JSON.parse(localStorage.getItem('kmfx_reviews') || '[]');
+    reviews = JSON.parse(localStorage.getItem('kmfx_reviews_' + uid) || '[]');
+    // Migrate old trades without accountId to first account
     trades.forEach(t => { if (!t.accountId) t.accountId = accounts[0].id; });
   } catch(e) { trades = []; reviews = []; accounts = []; }
 }
@@ -1615,6 +1651,7 @@ function getActiveAccount() { return accounts.find(a => a.id === activeAccountId
 
 function switchAccount(id) {
   activeAccountId = id;
+  localStorage.setItem('kmfx_activeAccount', id); // persist immediately
   saveData();
   updateAcctSwitcher();
   renderDashboard();
@@ -3133,7 +3170,8 @@ function generateInsights() {
 function updateExportStats() {
   const acctName = getActiveAccount()?.name || 'Account';
   document.getElementById('exportTradeCount').textContent = getActiveTrades().length + ' (' + acctName + ')';
-  document.getElementById('exportStorageSize').textContent = (new Blob([JSON.stringify(trades)]).size / 1024).toFixed(1) + ' KB';
+  const size = new Blob([localStorage.getItem('kmfx_trades') || '']).size;
+  document.getElementById('exportStorageSize').textContent = (size / 1024).toFixed(1) + ' KB';
 }
 
 function exportCSV() {
@@ -3208,7 +3246,7 @@ function showToast(msg, type = 'success') {
 // ============================================================
 // INIT
 // ============================================================
-async function init() {
+function init() {
   document.getElementById('topbarDate').textContent = new Date().toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
   
   // Set default datetime for new trade
@@ -3217,7 +3255,7 @@ async function init() {
   document.getElementById('f-datetime').value = local;
   document.getElementById('rev-date').value = now.toISOString().slice(0,10);
 
-  await loadData();
+  loadData();
   renderDashboard();
 
   // Always save active account before page closes / hides
