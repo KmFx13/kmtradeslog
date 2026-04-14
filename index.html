@@ -1529,18 +1529,25 @@ function bootAuth() {
           const isNew = !!window._isNewSignUp;
           window._isNewSignUp = false;
 
+          // Store current user uid for scoped storage FIRST before any reads/writes
+          window._currentUid = user.uid;
+
           // Load cloud data for this user
           try {
             const cloudData = await window._fbLoadUserData(user.uid);
             if (cloudData) {
               // Restore trades, accounts, profile pic from Firestore
-              if (cloudData.trades && cloudData.trades.length) {
+              // Only overwrite localStorage if Firestore has more/newer data
+              const localTrades = JSON.parse(localStorage.getItem('kmfx_trades_' + user.uid) || '[]');
+              if (cloudData.trades && cloudData.trades.length >= localTrades.length) {
                 localStorage.setItem('kmfx_trades_' + user.uid, JSON.stringify(cloudData.trades));
               }
-              if (cloudData.reviews && cloudData.reviews.length) {
+              const localReviews = JSON.parse(localStorage.getItem('kmfx_reviews_' + user.uid) || '[]');
+              if (cloudData.reviews && cloudData.reviews.length >= localReviews.length) {
                 localStorage.setItem('kmfx_reviews_' + user.uid, JSON.stringify(cloudData.reviews));
               }
-              if (cloudData.accounts && cloudData.accounts.length) {
+              const localAccounts = JSON.parse(localStorage.getItem('kmfx_accounts_' + user.uid) || '[]');
+              if (cloudData.accounts && cloudData.accounts.length >= localAccounts.length) {
                 localStorage.setItem('kmfx_accounts_' + user.uid, JSON.stringify(cloudData.accounts));
               }
               if (cloudData.activeAccountId) {
@@ -1551,9 +1558,6 @@ function bootAuth() {
               }
             }
           } catch(e) { console.warn('Could not load cloud data:', e); }
-
-          // Store current user uid for scoped storage
-          window._currentUid = user.uid;
 
           updateUserUI(user);
           init();
@@ -1612,7 +1616,13 @@ function saveData() {
       reviews,
       accounts,
       activeAccountId: activeAccountId || ''
-    }).catch(e => console.warn('Cloud sync failed:', e));
+    }).then(() => {
+      // Mark last successful sync time
+      localStorage.setItem('kmfx_last_sync_' + uid, new Date().toISOString());
+    }).catch(e => {
+      console.warn('Cloud sync failed:', e);
+      showToast('⚠️ Cloud sync failed — data saved locally only', 'error');
+    });
   }
 }
 function loadData() {
@@ -1651,7 +1661,6 @@ function getActiveAccount() { return accounts.find(a => a.id === activeAccountId
 
 function switchAccount(id) {
   activeAccountId = id;
-  localStorage.setItem('kmfx_activeAccount', id); // persist immediately
   saveData();
   updateAcctSwitcher();
   renderDashboard();
