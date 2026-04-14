@@ -9,6 +9,7 @@
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, updateProfile, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
   import { getFirestore, doc, getDoc, setDoc, updateDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+  import { getStorage, ref, uploadString, getDownloadURL, deleteObject } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyDKk0JNaGd3oUf7g4ZSQf0HJYDwgiooHTQ",
@@ -23,10 +24,12 @@
   const app = initializeApp(firebaseConfig);
   const auth = getAuth(app);
   const db = getFirestore(app);
+  const storage = getStorage(app);
 
   // Expose auth + firestore functions to global scope
   window._fbAuth = auth;
   window._fbDb = db;
+  window._fbStorage = storage;
 
   window._fbSignUp = async (name, username, email, password) => {
     const cred = await createUserWithEmailAndPassword(auth, email, password);
@@ -50,9 +53,38 @@
   window._fbResetPassword = (email) => sendPasswordResetEmail(auth, email);
   window._fbOnAuthStateChanged = (cb) => onAuthStateChanged(auth, cb);
 
-  // Save profile picture to Firestore (syncs across all devices)
+  // Upload profile picture to Firebase Storage, save URL in Firestore
   window._fbSaveProfilePic = async (uid, dataUrl) => {
-    await updateDoc(doc(db, 'users', uid), { profilePic: dataUrl });
+    const storageRef = ref(storage, 'users/' + uid + '/profile/avatar.jpg');
+    await uploadString(storageRef, dataUrl, 'data_url');
+    const url = await getDownloadURL(storageRef);
+    await updateDoc(doc(db, 'users', uid), { profilePic: url });
+    return url;
+  };
+
+  // Upload trade screenshot images to Firebase Storage, return array of URLs
+  window._fbUploadTradeImages = async (uid, tradeId, base64Images) => {
+    const urls = [];
+    for (let i = 0; i < base64Images.length; i++) {
+      const img = base64Images[i];
+      // Skip if already a URL (already uploaded)
+      if (img.startsWith('http')) { urls.push(img); continue; }
+      const storageRef = ref(storage, 'users/' + uid + '/trades/' + tradeId + '/img_' + i + '.jpg');
+      await uploadString(storageRef, img, 'data_url');
+      const url = await getDownloadURL(storageRef);
+      urls.push(url);
+    }
+    return urls;
+  };
+
+  // Delete trade images from Firebase Storage
+  window._fbDeleteTradeImages = async (uid, tradeId, count) => {
+    for (let i = 0; i < (count || 10); i++) {
+      try {
+        const storageRef = ref(storage, 'users/' + uid + '/trades/' + tradeId + '/img_' + i + '.jpg');
+        await deleteObject(storageRef);
+      } catch(e) { /* image may not exist, ignore */ }
+    }
   };
 
   // Load user cloud data (profile pic, trades, accounts)
@@ -1493,25 +1525,35 @@ function handleProfilePicUpload(e) {
   const file = e.target.files?.[0];
   if (!file) return;
   const reader = new FileReader();
-  reader.onload = ev => {
+  reader.onload = async ev => {
     const dataUrl = ev.target.result;
     const uid = window._currentUid || 'guest';
-    // Save per-user locally
-    localStorage.setItem('kmfx_profile_pic_' + uid, dataUrl);
-    // Save to Firestore so it syncs to ALL devices
-    if (uid !== 'guest' && window._fbSaveProfilePic) {
-      window._fbSaveProfilePic(uid, dataUrl)
-        .then(() => showToast('Profile picture synced to all devices! ✅'))
-        .catch(() => showToast('Profile picture saved locally ✅'));
-    } else {
-      showToast('Profile picture updated! ✅');
-    }
-    // Update sidebar avatar
+    // Show immediately in UI using base64 while upload happens
     const avatarEl = document.getElementById('sidebarAvatar');
     if (avatarEl) avatarEl.innerHTML = `<img src="${dataUrl}" alt="avatar">`;
-    // Update topbar avatar
     const btn = document.getElementById('userAvatarBtn');
     if (btn) btn.innerHTML = `<img src="${dataUrl}" alt="avatar">`;
+
+    if (uid !== 'guest' && window._fbSaveProfilePic) {
+      try {
+        showToast('Uploading profile picture... ⏳');
+        // Upload to Firebase Storage, get back a permanent URL
+        const url = await window._fbSaveProfilePic(uid, dataUrl);
+        // Save the URL (not base64) locally
+        localStorage.setItem('kmfx_profile_pic_' + uid, url);
+        // Update avatar with permanent URL
+        if (avatarEl) avatarEl.innerHTML = `<img src="${url}" alt="avatar">`;
+        if (btn) btn.innerHTML = `<img src="${url}" alt="avatar">`;
+        showToast('Profile picture synced to all devices! ✅');
+      } catch(err) {
+        // Fallback: save base64 locally
+        localStorage.setItem('kmfx_profile_pic_' + uid, dataUrl);
+        showToast('Profile picture saved locally ✅');
+      }
+    } else {
+      localStorage.setItem('kmfx_profile_pic_' + uid, dataUrl);
+      showToast('Profile picture updated! ✅');
+    }
   };
   reader.readAsDataURL(file);
   e.target.value = '';
@@ -1536,8 +1578,8 @@ function bootAuth() {
           try {
             const cloudData = await window._fbLoadUserData(user.uid);
             if (cloudData) {
-              // Restore trades, accounts, profile pic from Firestore
-              // Only overwrite localStorage if Firestore has more/newer data
+              // Cloud trades now contain Firebase Storage URLs for images — use directly.
+              // Cloud is the source of truth; overwrite local if cloud has same or more trades.
               const localTrades = JSON.parse(localStorage.getItem('kmfx_trades_' + user.uid) || '[]');
               if (cloudData.trades && cloudData.trades.length >= localTrades.length) {
                 localStorage.setItem('kmfx_trades_' + user.uid, JSON.stringify(cloudData.trades));
@@ -1604,25 +1646,40 @@ let currentDirection = '';
 
 function saveData() {
   const uid = window._currentUid || 'guest';
+  // Always save full data (including base64 images) to localStorage as backup
   localStorage.setItem('kmfx_trades_' + uid, JSON.stringify(trades));
   localStorage.setItem('kmfx_reviews_' + uid, JSON.stringify(reviews));
   localStorage.setItem('kmfx_accounts_' + uid, JSON.stringify(accounts));
   localStorage.setItem('kmfx_activeAccount_' + uid, activeAccountId || '');
 
-  // Sync to Firestore so data appears on all devices
-  if (uid !== 'guest' && window._fbSaveUserData) {
-    window._fbSaveUserData(uid, {
-      trades,
-      reviews,
-      accounts,
-      activeAccountId: activeAccountId || ''
-    }).then(() => {
-      // Mark last successful sync time
-      localStorage.setItem('kmfx_last_sync_' + uid, new Date().toISOString());
-    }).catch(e => {
-      console.warn('Cloud sync failed:', e);
-      showToast('⚠️ Cloud sync failed — data saved locally only', 'error');
-    });
+  // Sync to Firestore + Firebase Storage (fully cloud, all devices)
+  if (uid !== 'guest' && window._fbSaveUserData && window._fbUploadTradeImages) {
+    (async () => {
+      try {
+        // Upload any base64 images to Firebase Storage, replace with URLs
+        const tradesForCloud = await Promise.all(trades.map(async t => {
+          if (!t.images || !t.images.length) return t;
+          const hasBase64 = t.images.some(img => img.startsWith('data:'));
+          if (!hasBase64) return t; // already URLs, no re-upload needed
+          const urls = await window._fbUploadTradeImages(uid, t.id, t.images);
+          // Update localStorage too so local copy has URLs not base64
+          const idx = trades.findIndex(x => x.id === t.id);
+          if (idx > -1) trades[idx] = { ...trades[idx], images: urls };
+          localStorage.setItem('kmfx_trades_' + uid, JSON.stringify(trades));
+          return { ...t, images: urls };
+        }));
+
+        await window._fbSaveUserData(uid, {
+          trades: tradesForCloud,
+          reviews,
+          accounts,
+          activeAccountId: activeAccountId || ''
+        });
+        localStorage.setItem('kmfx_last_sync_' + uid, new Date().toISOString());
+      } catch(e) {
+        console.warn('Cloud sync failed:', e);
+      }
+    })();
   }
 }
 function loadData() {
@@ -2410,12 +2467,19 @@ function editTrade(id) {
 
 function deleteTrade(id) {
   if (!confirm('Delete this trade?')) return;
+  const trade = trades.find(t => t.id === id);
   trades = trades.filter(t => t.id !== id);
   saveData();
+  // Clean up images from Firebase Storage
+  const uid = window._currentUid;
+  if (uid && trade && window._fbDeleteTradeImages) {
+    const count = trade.images ? trade.images.length : (trade._imageCount || 0);
+    if (count > 0) window._fbDeleteTradeImages(uid, id, count);
+  }
   updateAcctSwitcher();
-  renderDashboard();     // auto-update dashboard
-  populateFilters();     // auto-update filters
-  renderTradeList();     // auto-update list
+  renderDashboard();
+  populateFilters();
+  renderTradeList();
   showToast('Trade deleted');
 }
 
