@@ -8,6 +8,7 @@
 <script type="module">
   import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
   import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, sendPasswordResetEmail, updateProfile, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+  import { getFirestore, doc, setDoc, getDoc } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
 
   const firebaseConfig = {
     apiKey: "AIzaSyDKk0JNaGd3oUf7g4ZSQf0HJYDwgiooHTQ",
@@ -21,9 +22,14 @@
 
   const app = initializeApp(firebaseConfig);
   const auth = getAuth(app);
+  const db = getFirestore(app);
 
   // Expose auth functions to global scope
   window._fbAuth = auth;
+  window._fbDb = db;
+  window._fbDoc = doc;
+  window._fbSetDoc = setDoc;
+  window._fbGetDoc = getDoc;
   window._fbSignUp = (name, username, email, password) => {
     return createUserWithEmailAndPassword(auth, email, password).then(cred => {
       return updateProfile(cred.user, { displayName: name + '|' + username });
@@ -1516,30 +1522,82 @@ let currentTags = [];
 let currentEmotion = '';
 let currentDirection = '';
 
-function saveData() {
+// ── Cloud save (Firestore) with localStorage fallback ──────────────────────
+function _currentUid() {
+  return window._fbAuth?.currentUser?.uid || null;
+}
+
+async function saveData() {
+  // Always keep localStorage in sync as a fast local cache
   localStorage.setItem('kmfx_trades', JSON.stringify(trades));
   localStorage.setItem('kmfx_reviews', JSON.stringify(reviews));
   localStorage.setItem('kmfx_accounts', JSON.stringify(accounts));
   localStorage.setItem('kmfx_activeAccount', activeAccountId || '');
+
+  // Also push to Firestore if user is logged in
+  const uid = _currentUid();
+  if (!uid || !window._fbDb) return;
+  try {
+    const ref = window._fbDoc(window._fbDb, 'users', uid);
+    await window._fbSetDoc(ref, {
+      trades,
+      reviews,
+      accounts,
+      activeAccountId: activeAccountId || '',
+      updatedAt: new Date().toISOString()
+    }, { merge: true });
+  } catch(e) {
+    console.warn('Firestore save failed, data kept locally:', e.message);
+  }
 }
-function loadData() {
+
+async function loadData() {
+  const uid = _currentUid();
+
+  // Try Firestore first (cloud data wins)
+  if (uid && window._fbDb) {
+    try {
+      const ref = window._fbDoc(window._fbDb, 'users', uid);
+      const snap = await window._fbGetDoc(ref);
+      if (snap.exists()) {
+        const d = snap.data();
+        accounts = Array.isArray(d.accounts) ? d.accounts : [];
+        activeAccountId = d.activeAccountId || null;
+        trades = Array.isArray(d.trades) ? d.trades : [];
+        reviews = Array.isArray(d.reviews) ? d.reviews : [];
+        // Ensure default account exists
+        if (!accounts.length) {
+          const defAcct = { id: genId(), name: 'Main Live Account', type: 'live', broker: '', number: '', balance: 10000, currency: 'USD', maxDaily: 5, maxDD: 10, target: null, color: 'gold', notes: '', createdAt: new Date().toISOString() };
+          accounts.push(defAcct);
+          activeAccountId = defAcct.id;
+        }
+        if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) activeAccountId = accounts[0].id;
+        trades.forEach(t => { if (!t.accountId) t.accountId = accounts[0].id; });
+        // Mirror to localStorage cache
+        localStorage.setItem('kmfx_trades', JSON.stringify(trades));
+        localStorage.setItem('kmfx_reviews', JSON.stringify(reviews));
+        localStorage.setItem('kmfx_accounts', JSON.stringify(accounts));
+        localStorage.setItem('kmfx_activeAccount', activeAccountId || '');
+        return;
+      }
+    } catch(e) {
+      console.warn('Firestore load failed, falling back to localStorage:', e.message);
+    }
+  }
+
+  // Fallback: load from localStorage
   try {
     accounts = JSON.parse(localStorage.getItem('kmfx_accounts') || '[]');
     activeAccountId = localStorage.getItem('kmfx_activeAccount') || null;
     if (!accounts.length) {
-      // Create default account
       const defAcct = { id: genId(), name: 'Main Live Account', type: 'live', broker: '', number: '', balance: 10000, currency: 'USD', maxDaily: 5, maxDD: 10, target: null, color: 'gold', notes: '', createdAt: new Date().toISOString() };
       accounts.push(defAcct);
       activeAccountId = defAcct.id;
     }
-    if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) {
-      activeAccountId = accounts[0].id;
-    }
-    // Load trades for active account
+    if (!activeAccountId || !accounts.find(a => a.id === activeAccountId)) activeAccountId = accounts[0].id;
     const allTrades = JSON.parse(localStorage.getItem('kmfx_trades') || '[]');
     trades = allTrades.filter ? allTrades : [];
     reviews = JSON.parse(localStorage.getItem('kmfx_reviews') || '[]');
-    // Migrate old trades without accountId to first account
     trades.forEach(t => { if (!t.accountId) t.accountId = accounts[0].id; });
   } catch(e) { trades = []; reviews = []; accounts = []; }
 }
@@ -1557,7 +1615,6 @@ function getActiveAccount() { return accounts.find(a => a.id === activeAccountId
 
 function switchAccount(id) {
   activeAccountId = id;
-  localStorage.setItem('kmfx_activeAccount', id); // persist immediately
   saveData();
   updateAcctSwitcher();
   renderDashboard();
@@ -3076,8 +3133,7 @@ function generateInsights() {
 function updateExportStats() {
   const acctName = getActiveAccount()?.name || 'Account';
   document.getElementById('exportTradeCount').textContent = getActiveTrades().length + ' (' + acctName + ')';
-  const size = new Blob([localStorage.getItem('kmfx_trades') || '']).size;
-  document.getElementById('exportStorageSize').textContent = (size / 1024).toFixed(1) + ' KB';
+  document.getElementById('exportStorageSize').textContent = (new Blob([JSON.stringify(trades)]).size / 1024).toFixed(1) + ' KB';
 }
 
 function exportCSV() {
@@ -3152,7 +3208,7 @@ function showToast(msg, type = 'success') {
 // ============================================================
 // INIT
 // ============================================================
-function init() {
+async function init() {
   document.getElementById('topbarDate').textContent = new Date().toLocaleDateString('en-US', { weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' });
   
   // Set default datetime for new trade
@@ -3161,7 +3217,7 @@ function init() {
   document.getElementById('f-datetime').value = local;
   document.getElementById('rev-date').value = now.toISOString().slice(0,10);
 
-  loadData();
+  await loadData();
   renderDashboard();
 
   // Always save active account before page closes / hides
